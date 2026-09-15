@@ -114,7 +114,17 @@ target_dir_gb() {
   du -sBG "$CARGO_TARGET_DIR" 2>/dev/null | cut -dG -f1
 }
 
-build_running() { pgrep -f "zed-cb build" >/dev/null 2>&1; }
+# A PID lock file, not a pgrep on the command line: matching "zed-cb build" as a
+# string also matches any shell that merely mentions it, so a wrapper or a
+# watcher loop reads as a live build and makes this guard refuse to act.
+BUILD_LOCK="$CARGO_TARGET_DIR/.zed-cb-build.pid"
+
+build_running() {
+  [ -f "$BUILD_LOCK" ] || return 1
+  local pid
+  pid=$(cat "$BUILD_LOCK" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
 
 # ---------------------------------------------------------------- bootstrap --
 
@@ -264,7 +274,7 @@ cmd_doctor() {
   echo "jobs          $CARGO_BUILD_JOBS"
   echo "rustflags     $RUSTFLAGS"
   echo "target dir    $CARGO_TARGET_DIR ($(target_dir_gb) GB, cap ${TARGET_CAP_GB} GB)"
-  echo "installed     $([ -x "$APP_DIR/bin/zed" ] && "$APP_DIR/libexec/zed-editor" --version 2>/dev/null || echo 'not installed')"
+  echo "installed     $("$APP_DIR/bin/zed" --version 2>/dev/null || echo 'not installed')"
   echo
   echo "tools:"
   for b in mold clang llvm-objcopy musl-gcc jq envsubst rustup; do
@@ -325,6 +335,11 @@ cmd_build() {
   used=$(target_dir_gb)
   [ "$used" -gt "$TARGET_CAP_GB" ] &&
     warn "target dir is ${used} GB (cap ${TARGET_CAP_GB} GB); 'zed-cb clean' frees it"
+  build_running && die "another build is already running (pid $(cat "$BUILD_LOCK"))"
+  mkdir -p "$CARGO_TARGET_DIR"
+  echo $$ > "$BUILD_LOCK"
+  trap 'rm -f "$BUILD_LOCK"' EXIT
+
   msg "release bundle, $CARGO_BUILD_JOBS jobs, mold linker, sccache on"
   t0=$SECONDS
   script/bundle-linux
@@ -371,7 +386,7 @@ cmd_install() {
   command -v gtk-update-icon-cache >/dev/null 2>&1 &&
     gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
 
-  msg "installed: $("$APP_DIR/libexec/zed-editor" --version 2>/dev/null || echo "$APP_DIR")"
+  msg "installed: $("$APP_DIR/bin/zed" --version 2>/dev/null || echo "$APP_DIR")"
   msg "launch with: $CLI_NAME-run   (or 'zed-cb link-default' to claim zed/zeditor)"
 }
 
