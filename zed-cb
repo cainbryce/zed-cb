@@ -53,14 +53,23 @@ SCCACHE_BASEDIRS='["'"$HOME"'/Projects", "'"$HOME"'/Sources", "/mnt/games/.makep
 
 export RUSTC_WRAPPER="${RUSTC_WRAPPER:-$SCCACHE_BIN}"
 
-# script/bundle-linux exports RUSTFLAGS, and RUSTFLAGS wins outright over both
-# [build] and [target.*] rustflags in .cargo/config.toml -- cargo picks exactly
-# one source, it does not merge them. So the repo's own flags have to be
-# restated here or the bundle silently builds without them. Keeping the same
-# string on the `run` path too means both paths hash to the same sccache keys.
-ZED_REPO_RUSTFLAGS='-C symbol-mangling-version=v0 --cfg tokio_unstable'
-LINK_RUSTFLAGS='-C link-arg=-fuse-ld=mold'
-export RUSTFLAGS="${ZED_CB_RUSTFLAGS:-$ZED_REPO_RUSTFLAGS $LINK_RUSTFLAGS}"
+# Extra flags go in through cargo's per-target variable, never RUSTFLAGS.
+# RUSTFLAGS wins outright over every rustflags key in .cargo/config.toml --
+# cargo picks one source, it does not merge them -- so setting it drops the
+# repo's own flags, and script/bundle-linux now refuses to run with it set for
+# exactly that reason. CARGO_TARGET_<TRIPLE>_RUSTFLAGS is the environment form
+# of target.<triple>.rustflags, which cargo joins with the target.'cfg(..)'
+# tables the repo and .cargo/bundle-config.toml declare. The same variable is
+# set on the `run` path, so both paths hash to the same sccache keys.
+#
+# Only the host triple gets it: the musl remote_server keeps the linker
+# upstream builds it with.
+HOST_TRIPLE=$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+HOST_TRIPLE="${HOST_TRIPLE:-$(uname -m)-unknown-linux-gnu}"
+HOST_RUSTFLAGS_VAR="CARGO_TARGET_$(printf '%s' "$HOST_TRIPLE" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+HOST_RUSTFLAGS="${ZED_CB_RUSTFLAGS:--C link-arg=-fuse-ld=mold}"
+export "$HOST_RUSTFLAGS_VAR=$HOST_RUSTFLAGS"
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 
 # codegen-units=1 + thin LTO on a ~1500-crate tree will take a 16 GB box past
 # its RAM at -j12 and start thrashing swap; a single rustc here peaks near 9 GB.
@@ -95,18 +104,12 @@ need_src() {
   cd "$SRC"
 }
 
-# The restated RUSTFLAGS above are a copy of what the repo declares. If upstream
-# changes them, say so instead of silently building with stale flags.
-check_rustflags_drift() {
-  local declared flag
-  declared=$(sed -n '/^\[build\]/,/^\[/p' .cargo/config.toml 2>/dev/null |
-             grep -o '"[^"]*"' | tr -d '"' | tr '\n' ' ')
-  for flag in $declared; do
-    case " $RUSTFLAGS " in
-      *" $flag "*) ;;
-      *) warn "repo declares rustflag '$flag' which this script does not pass; reconcile .cargo/config.toml with ZED_REPO_RUSTFLAGS in $SELF" ;;
-    esac
-  done
+# An older script/bundle-linux exports RUSTFLAGS itself, which overrides the
+# per-target variable above and links without mold or the repo's flags.
+need_current_bundle_script() {
+  if grep -q '^ *export RUSTFLAGS=' script/bundle-linux; then
+    die "this checkout's script/bundle-linux still sets RUSTFLAGS; run '$CLI_NAME sync' first"
+  fi
 }
 
 target_dir_gb() {
@@ -272,7 +275,7 @@ cmd_doctor() {
   echo "zed version   $(script/get-crate-version zed 2>/dev/null || echo '?')"
   echo "toolchain     $(rustc --version)"
   echo "jobs          $CARGO_BUILD_JOBS"
-  echo "rustflags     $RUSTFLAGS"
+  echo "rustflags     $HOST_RUSTFLAGS_VAR=$HOST_RUSTFLAGS"
   echo "target dir    $CARGO_TARGET_DIR ($(target_dir_gb) GB, cap ${TARGET_CAP_GB} GB)"
   echo "installed     $("$APP_DIR/bin/zed" --version 2>/dev/null || echo 'not installed')"
   echo
@@ -290,7 +293,6 @@ cmd_doctor() {
     grep -E 'Cache hits|Cache misses|hits rate|Cache size|Max cache size|Base directories' | sed 's/^/  /'
   echo
   df -h "$CARGO_TARGET_DIR" "$SCCACHE_DIR" 2>/dev/null | sed 's/^/  /'
-  check_rustflags_drift
 }
 
 # Local commits on main (this script, for one) are rebased onto upstream/main
@@ -323,14 +325,13 @@ cmd_sync() {
 
 cmd_run() {
   need_src
-  check_rustflags_drift
   msg "debug build + run (target: $CARGO_TARGET_DIR)"
   cargo run "$@"
 }
 
 cmd_build() {
   need_src
-  check_rustflags_drift
+  need_current_bundle_script
   local used t0
   used=$(target_dir_gb)
   [ "$used" -gt "$TARGET_CAP_GB" ] &&
