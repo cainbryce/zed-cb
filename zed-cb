@@ -302,7 +302,9 @@ cmd_sync() {
   need_src
   git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "$UPSTREAM_URL"
   msg "fetching upstream"
-  git fetch upstream --tags --prune
+  # Upstream moves some of its tags (nightly, collab-staging). Without --force
+  # a tag that already exists here is rejected and the fetch exits non-zero.
+  git fetch upstream --tags --prune --force
 
   local branch
   branch=$(git rev-parse --abbrev-ref HEAD)
